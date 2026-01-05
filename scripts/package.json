@@ -1,0 +1,25 @@
+{
+  "name": "poller-worker-scripts",
+  "version": "1.0.0",
+  "description": "Utility scripts for poller worker service",
+  "main": "push_polling_job.js",
+  "scripts": {
+    "push": "node push_polling_job.js",
+    "check-polling": "node check_polling_queue.js",
+    "check-events": "node check_file_event_queue.js",
+    "verify": "node verify_kafka_setup.js"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4"
+  },
+  "keywords": [
+    "kafka",
+    "poller",
+    "worker",
+    "testing",
+    "queue"
+  ],
+  "author": "Poller Worker Team",
+  "license": "MIT"
+}
+
