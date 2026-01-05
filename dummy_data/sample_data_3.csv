@@ -1,0 +1,7 @@
+product_id,product_name,category,price,stock_quantity
+P001,Laptop Pro,Electronics,1299.99,50
+P002,Wireless Mouse,Electronics,29.99,200
+P003,Office Chair,Furniture,199.99,75
+P004,Standing Desk,Furniture,499.99,30
+P005,Monitor 27",Electronics,349.99,100
+

@@ -1,0 +1,11 @@
+{
+    "cvDatabaseType": "CV_SOURCE",
+    "configurationType": "MINIO_CONFIGURATION",
+    "configurationValue": {
+        "endPoint": "http://localhost:9000",
+        "access": "minioadmin",
+        "secret": "minioadmin",
+        "bucketName": "iis-internal-dev-bucket"
+    }
+}
+
