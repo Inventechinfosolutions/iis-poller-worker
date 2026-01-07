@@ -47,12 +47,35 @@ class SourceConfig(BaseModel):
     connection_params: Optional[Dict[str, Any]] = Field(None, description="Additional connection parameters")
 
 
+class MinIOConfiguration(BaseModel):
+    """MinIO configuration model (same format as batch-details)."""
+    type: str = Field(..., description="Configuration type")
+    endpoint: str = Field(..., description="MinIO endpoint")
+    accessKey: str = Field(..., description="MinIO access key")
+    secretKey: str = Field(..., description="MinIO secret key")
+    bucketName: str = Field(..., description="MinIO bucket name")
+
+
+class MySQLConfiguration(BaseModel):
+    """MySQL configuration model (same format as batch-details)."""
+    type: str = Field(..., description="Configuration type")
+    host: str = Field(..., description="MySQL host")
+    port: int = Field(..., description="MySQL port")
+    username: str = Field(..., description="MySQL username")
+    password: str = Field(..., description="MySQL password")
+    database: str = Field(..., description="MySQL database name")
+    tableName: str = Field(..., description="MySQL table name")
+    columns: Optional[Dict[str, Any]] = Field(None, description="Table column definitions")
+
+
 class PollingJob(BaseModel):
     """Polling job model."""
     job_id: str = Field(..., description="Unique job identifier")
     org_id: Optional[str] = Field(None, description="Organization identifier")
     connection_list: Optional[List[SourceConfig]] = Field(None, description="List of source connections to poll (MinIO, MySQL, etc.)")
     source_config: Optional[SourceConfig] = Field(None, description="Single source configuration (legacy support)")
+    configurationType: Optional[MinIOConfiguration] = Field(None, description="MinIO configuration (same format as batch-details)")
+    mysqlConfiguration: Optional[MySQLConfiguration] = Field(None, description="MySQL configuration (same format as batch-details)")
     file_pattern: Optional[str] = Field(None, description="File pattern to match")
     priority: str = Field("normal", description="Job priority")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
@@ -62,13 +85,49 @@ class PollingJob(BaseModel):
     @model_validator(mode='after')
     def validate_connections(self):
         """Validate and normalize connection configuration."""
-        # If connection_list is not provided, try to use source_config (backward compatibility)
+        # If connection_list is already provided, use it
+        if self.connection_list:
+            # If org_id is not provided, generate a default (backward compatibility for old jobs)
+            if not self.org_id:
+                self.org_id = f"org_{self.job_id}"
+            return self
+        
+        # Try to build connection_list from configurationType and mysqlConfiguration (same format as batch-details)
+        if self.configurationType or self.mysqlConfiguration:
+            self.connection_list = []
+            
+            # Convert MinIO configuration to SourceConfig
+            if self.configurationType:
+                minio_config = SourceConfig(
+                    source_type=SourceType.MINIO,
+                    endpoint=self.configurationType.endpoint,
+                    access_key=self.configurationType.accessKey,
+                    secret_key=self.configurationType.secretKey,
+                    bucket_name=self.configurationType.bucketName,
+                    path="",  # Default path, can be overridden if needed
+                )
+                self.connection_list.append(minio_config)
+            
+            # Convert MySQL configuration to SourceConfig
+            if self.mysqlConfiguration:
+                mysql_config = SourceConfig(
+                    source_type=SourceType.MYSQL,
+                    database_host=self.mysqlConfiguration.host,
+                    database_port=self.mysqlConfiguration.port,
+                    database_name=self.mysqlConfiguration.database,
+                    database_user=self.mysqlConfiguration.username,
+                    database_password=self.mysqlConfiguration.password,
+                    database_table=self.mysqlConfiguration.tableName,
+                )
+                self.connection_list.append(mysql_config)
+        
+        # If connection_list is still not set, try to use source_config (backward compatibility)
         if not self.connection_list:
             if self.source_config:
                 self.connection_list = [self.source_config]
                 self.source_config = None  # Clear after conversion
             else:
-                raise ValueError("Either 'connection_list' or 'source_config' must be provided")
+                raise ValueError("Either 'connection_list', 'source_config', or 'configurationType'/'mysqlConfiguration' must be provided")
         
         # If org_id is not provided, generate a default (backward compatibility for old jobs)
         if not self.org_id:

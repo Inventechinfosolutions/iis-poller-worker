@@ -5,7 +5,7 @@ Simple, production-ready implementation following SOLID principles.
 
 import asyncio
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 import structlog
 
 from src.models.schemas import PollingJob, FileEvent, SourceConfig
@@ -198,6 +198,53 @@ class PollerWorker:
             "org_id": job.org_id,
             "connection_count": len(job.connection_list)
         }
+    
+    def _convert_connection_list_to_dict(self, connection_list: List[SourceConfig]) -> List[Dict[str, Any]]:
+        """Convert SourceConfig list to dict format expected by resume parser."""
+        result = []
+        for conn in connection_list:
+            # If it's already a dict, use it as-is (shouldn't happen but handle it)
+            if isinstance(conn, dict):
+                result.append(conn)
+                continue
+            
+            # Use model_dump to get all fields, including any extra fields from the original message
+            conn_dict = conn.model_dump(exclude_none=True, mode='json')
+            
+            # Ensure source_type is a string value
+            if "source_type" in conn_dict and hasattr(conn_dict["source_type"], 'value'):
+                conn_dict["source_type"] = conn_dict["source_type"].value
+            
+            # For MySQL sources, ensure field names match what resume parser expects
+            # Master-service sends: host, port, database, username, password, table
+            # SourceConfig model has: database_host, database_port, database_name, database_user, database_password, database_table
+            # If the original message had host/port/etc, they should be preserved in model_dump
+            # But if only database_* fields exist, convert them
+            if conn_dict.get("source_type") == "mysql":
+                # Convert database_* fields to expected format if original format not present
+                if "host" not in conn_dict and conn.database_host:
+                    conn_dict["host"] = conn.database_host
+                if "port" not in conn_dict and conn.database_port:
+                    conn_dict["port"] = conn.database_port
+                if "database" not in conn_dict and conn.database_name:
+                    conn_dict["database"] = conn.database_name
+                if "username" not in conn_dict and conn.database_user:
+                    conn_dict["username"] = conn.database_user
+                if "password" not in conn_dict and conn.database_password:
+                    conn_dict["password"] = conn.database_password
+                if "table" not in conn_dict and conn.database_table:
+                    conn_dict["table"] = conn.database_table
+                
+                # Remove database_* fields to avoid confusion
+                conn_dict.pop("database_host", None)
+                conn_dict.pop("database_port", None)
+                conn_dict.pop("database_name", None)
+                conn_dict.pop("database_user", None)
+                conn_dict.pop("database_password", None)
+                conn_dict.pop("database_table", None)
+            
+            result.append(conn_dict)
+        return result
     
     async def _handle_job_failure(self, job: PollingJob, error: Exception):
         """Handle job failure by sending to DLQ and updating database."""
@@ -440,10 +487,17 @@ class PollerWorker:
                 file_event.processed_at = datetime.utcnow()
             
             # Publish batch to Kafka
+            # Include connection_list in metadata so resume parser can extract MySQL config
+            # Convert to dict format expected by resume parser
+            batch_metadata = {
+                **(job.metadata or {}), 
+                "org_id": job.org_id,
+                "connection_list": self._convert_connection_list_to_dict(job.connection_list) if job.connection_list else []
+            }
             await retry_handler.execute_with_retry(
                 file_event_queue_producer.publish_file_events_batch,
                 batch_files,
-                metadata={**(job.metadata or {}), "org_id": job.org_id},
+                metadata=batch_metadata,
                 operation_name="publish_file_events_batch",
                 context={**context, "batch_number": batch_number, "batch_size": len(batch_files)},
                 retryable_exceptions=(Exception,)
@@ -501,10 +555,17 @@ class PollerWorker:
         file_event.job_id = job.job_id
         file_event.processed_at = datetime.utcnow()
         
+        # Include connection_list in metadata so resume parser can extract MySQL config
+        # Convert to dict format expected by resume parser
+        file_metadata = {
+            **(job.metadata or {}), 
+            "org_id": job.org_id,
+            "connection_list": self._convert_connection_list_to_dict(job.connection_list) if job.connection_list else []
+        }
         await retry_handler.execute_with_retry(
             file_event_queue_producer.publish_file_event,
             file_event,
-            metadata={**(job.metadata or {}), "org_id": job.org_id},
+            metadata=file_metadata,
             operation_name="publish_file_event",
             context={**context, "file_name": file_event.file_name, "event_id": file_event.event_id},
             retryable_exceptions=(Exception,)
