@@ -189,11 +189,17 @@ class FileEventQueueProducer:
             return
         
         try:
+            # Extract connection_list from metadata if available (for top-level inclusion)
+            connection_list = None
+            if metadata and "connection_list" in metadata:
+                connection_list = metadata.get("connection_list")
+            
             # Create batch message payload
             batch_message = {
                 "batch_id": str(uuid.uuid4()),
                 "batch_size": len(file_events),
                 "job_id": file_events[0].job_id if file_events else None,
+                "connection_list": connection_list,  # Include connection_list at top level for easy extraction
                 "events": []
             }
             
