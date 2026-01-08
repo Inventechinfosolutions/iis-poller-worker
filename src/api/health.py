@@ -5,10 +5,11 @@ Provides REST endpoints for health checks and metrics.
 
 from typing import Dict, Any, Optional, List
 import structlog
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel
 from prometheus_client import generate_latest
+import os
 
 from src.config.settings import settings
 from src.utils.monitoring import health_checker, metrics_collector
@@ -19,6 +20,12 @@ from src.models.poller_jobs import JobStatus
 
 logger = structlog.get_logger(__name__)
 
+# Get API prefix from environment (default: poller-worker/api/v1)
+api_prefix = os.getenv("API_PREFIX", "poller-worker/api/v1")
+
+# Create router with prefix (similar to jd-service pattern)
+router = APIRouter(prefix=f"/{api_prefix}", tags=["poller-worker"])
+
 # Create FastAPI app for health checks
 app = FastAPI(
     title="Poller Worker Health API",
@@ -27,6 +34,9 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+# Include router
+app.include_router(router)
 
 
 class HealthResponse(BaseModel):
@@ -37,24 +47,24 @@ class HealthResponse(BaseModel):
     checks: Dict[str, Any]
 
 
-@app.get("/", response_model=Dict[str, str])
+@router.get("/", response_model=Dict[str, str])
 async def root():
     """Root endpoint with API information."""
     return {
         "message": "Poller Worker Health API",
         "version": settings.version,
         "docs": "/docs",
-        "health": "/health",
-        "ready": "/ready",
-        "metrics": "/metrics",
-        "jobs": "/api/jobs",
-        "job_by_id": "/api/jobs/{job_id}",
-        "file_events": "/api/file-events",
-        "file_event_by_id": "/api/file-events/{event_id}"
+        "health": f"/{api_prefix}/health",
+        "ready": f"/{api_prefix}/ready",
+        "metrics": f"/{api_prefix}/metrics",
+        "jobs": f"/{api_prefix}/api/jobs",
+        "job_by_id": f"/{api_prefix}/api/jobs/{{job_id}}",
+        "file_events": f"/{api_prefix}/api/file-events",
+        "file_event_by_id": f"/{api_prefix}/api/file-events/{{event_id}}"
     }
 
 
-@app.get("/health", response_model=HealthResponse)
+@router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
     try:
@@ -65,7 +75,7 @@ async def health_check():
         raise HTTPException(status_code=500, detail="Health check failed")
 
 
-@app.get("/ready")
+@router.get("/ready")
 async def readiness_check():
     """Readiness check endpoint for Kubernetes."""
     try:
@@ -92,7 +102,7 @@ async def readiness_check():
         )
 
 
-@app.get("/metrics")
+@router.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
     try:
@@ -133,7 +143,7 @@ class PaginatedJobsResponse(BaseModel):
     total_pages: int
 
 
-@app.get("/api/jobs", response_model=PaginatedJobsResponse)
+@router.get("/api/jobs", response_model=PaginatedJobsResponse)
 async def get_jobs(
     org_id: Optional[str] = Query(None, description="Filter by organization ID"),
     status: Optional[str] = Query(None, description="Filter by job status (PENDING, PROCESSING, COMPLETED, FAILED, RETRYING)"),
@@ -203,7 +213,7 @@ async def get_jobs(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve jobs: {str(e)}")
 
 
-@app.get("/api/jobs/{job_id}", response_model=PollerJobResponse)
+@router.get("/api/jobs/{job_id}", response_model=PollerJobResponse)
 async def get_job_by_id(job_id: str):
     """Get a specific job by job_id."""
     try:
@@ -260,7 +270,7 @@ class PaginatedFileEventsResponse(BaseModel):
     total_pages: int
 
 
-@app.get("/api/file-events", response_model=PaginatedFileEventsResponse)
+@router.get("/api/file-events", response_model=PaginatedFileEventsResponse)
 async def get_file_events(
     poller_job_id: Optional[str] = Query(None, description="Filter by poller job ID (UUID)"),
     page: int = Query(1, ge=1, description="Page number (starts from 1)"),
@@ -334,7 +344,7 @@ async def get_file_events(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve file events: {str(e)}")
 
 
-@app.get("/api/file-events/{event_id}", response_model=FileEventResponse)
+@router.get("/api/file-events/{event_id}", response_model=FileEventResponse)
 async def get_file_event_by_id(event_id: str):
     """Get a specific file event by id (UUID)."""
     try:
@@ -376,4 +386,3 @@ async def get_file_event_by_id(event_id: str):
     except Exception as e:
         logger.error("Failed to get file event", event_id=event_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to retrieve file event: {str(e)}")
-

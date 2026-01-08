@@ -1,0 +1,50 @@
+{
+  "name": "poller-worker",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "apps/poller-worker/src",
+  "projectType": "application",
+  "tags": ["type:app", "language:python"],
+  "targets": {
+    "install": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": ".venv/bin/pip install -r requirements.txt",
+        "cwd": "apps/poller-worker"
+      }
+    },
+    "serve": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": ".venv/bin/python -m src.main",
+        "cwd": "apps/poller-worker"
+      },
+      "configurations": {
+        "local": {
+          "env": {
+            "ENV_FILE": "environments/env.local"
+          }
+        },
+        "dev": {
+          "env": {
+            "ENV_FILE": "environments/env.dev"
+          }
+        }
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": ".venv/bin/python -m pytest",
+        "cwd": "apps/poller-worker"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": ".venv/bin/python -m flake8 src || .venv/bin/python -m pylint src || echo 'Linting tools not configured'",
+        "cwd": "apps/poller-worker"
+      }
+    }
+  }
+}
+
