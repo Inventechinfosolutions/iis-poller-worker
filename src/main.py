@@ -56,7 +56,7 @@ class PollerWorkerApplication:
             metrics_collector.start_metrics_server()
             
             # Start health check API server (FastAPI)
-            health_api_port = getattr(settings, 'health_api_port', 8001)
+            health_api_port = getattr(settings, 'health_api_port', 3009)
             health_api_thread = Thread(
                 target=lambda: uvicorn.run(
                     health_app,

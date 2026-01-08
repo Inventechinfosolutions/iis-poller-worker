@@ -10,7 +10,9 @@ from dotenv import load_dotenv
 import os
 
 # Load environment variables
-load_dotenv()
+# Check for ENV_FILE environment variable, otherwise default to .env
+env_file = os.getenv("ENV_FILE", ".env")
+load_dotenv(env_file)
 
 
 class PollerWorkerConfig(BaseSettings):
@@ -20,7 +22,7 @@ class PollerWorkerConfig(BaseSettings):
     name: str = Field("iis-poller-worker", env="APP_NAME")
     version: str = Field("1.0.0", env="APP_VERSION")
     worker_timeout: int = Field(300, env="WORKER_TIMEOUT")
-    health_api_port: int = Field(8001, env="HEALTH_API_PORT")  # Port for health check API
+    health_api_port: int = Field(3009, env="HEALTH_API_PORT")  # Port for health check API
     
     # Kafka Configuration
     kafka_bootstrap_servers: str = Field("localhost:9092", env="KAFKA_BOOTSTRAP_SERVERS")
