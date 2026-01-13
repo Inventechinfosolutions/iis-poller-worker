@@ -12,6 +12,12 @@ import os
 # Load environment variables
 # Check for ENV_FILE environment variable, otherwise default to .env
 env_file = os.getenv("ENV_FILE", ".env")
+# Resolve path relative to project root (apps/poller-worker)
+if not os.path.isabs(env_file):
+    # Get the project root directory (apps/poller-worker)
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # src/config
+    project_root = os.path.dirname(os.path.dirname(current_dir))  # apps/poller-worker
+    env_file = os.path.join(project_root, env_file)
 load_dotenv(env_file)
 
 
