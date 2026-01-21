@@ -4,6 +4,8 @@ Simple, production-ready implementation following SOLID principles.
 """
 
 import asyncio
+import uuid
+import mimetypes
 from datetime import datetime
 from typing import Dict, Any, List
 import structlog
@@ -28,6 +30,7 @@ from src.utils.memory_manager import memory_manager
 from src.utils.backpressure import backpressure_manager
 from src.utils.tracing import tracer
 from src.config.settings import settings
+from src.clients.minio_client import MinIOClient
 
 logger = structlog.get_logger(__name__)
 
@@ -444,7 +447,12 @@ class PollerWorker:
                    **context)
         
         # Process only ONE batch per job execution (maximum batch_size per batch)
-        max_batch_size = settings.max_file_batch_size
+        # Use batch_size from job if provided, otherwise fall back to settings
+        max_batch_size = job.batch_size if job.batch_size is not None else settings.max_file_batch_size
+        if job.batch_size is not None:
+            logger.info("Using batch_size from job", batch_size=job.batch_size, **context)
+        else:
+            logger.info("Using default batch_size from settings", batch_size=settings.max_file_batch_size, **context)
         total_files = len(files_to_process)
         
         if total_files == 0:
@@ -485,6 +493,114 @@ class PollerWorker:
             for file_event in batch_files:
                 file_event.job_id = job.job_id
                 file_event.processed_at = datetime.utcnow()
+
+            # If nxtworkforce flag is set, first upload the file bytes to local MinIO (env.local MINIO_* creds)
+            # and publish file events pointing to the uploaded object.
+            nxtworkforce_enabled = bool((job.metadata or {}).get("nxtworkforce"))
+            if nxtworkforce_enabled:
+                local_bucket = settings.nxtworkforce_save_bucket
+                local_minio = MinIOClient(
+                    {
+                        "endpoint": settings.minio_endpoint,
+                        "access_key": settings.minio_access_key,
+                        "secret_key": settings.minio_secret_key,
+                        "minio_secure": settings.minio_secure,
+                    }
+                )
+
+                for file_event in batch_files:
+                    file_bytes = await source_connector.read_file(source_config, file_event.file_path)
+                    if not file_bytes:
+                        raise RuntimeError(f"Empty file bytes for {file_event.file_path}")
+
+                    # Generate UUID for object key (without extension)
+                    original_file_name = file_event.file_name or (
+                        file_event.file_path.split("/")[-1] if file_event.file_path else "file"
+                    )
+                    
+                    # Extract file extension for metadata (but don't include in object key)
+                    file_extension = ""
+                    if original_file_name and "." in original_file_name:
+                        file_extension = "." + original_file_name.rsplit(".", 1)[-1]
+                    
+                    # Generate UUID (without extension) for object key and database ID
+                    file_uuid = str(uuid.uuid4())
+                    # Use UUID only as object key (no extension)
+                    dest_object_key = file_uuid
+
+                    # Determine MIME type from file extension
+                    mime_type, _ = mimetypes.guess_type(original_file_name)
+                    if not mime_type:
+                        # Fallback to common types based on extension
+                        extension_lower = file_extension.lower() if file_extension else ""
+                        mime_type_map = {
+                            ".pdf": "application/pdf",
+                            ".doc": "application/msword",
+                            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            ".txt": "text/plain",
+                            ".rtf": "application/rtf",
+                        }
+                        mime_type = mime_type_map.get(extension_lower, "application/octet-stream")
+
+                    # Prepare metadata to store with the object in MinIO
+                    # Only include specific keys: Filename, Id, Mimetype, Content-Type, Entityid, Entitytype, Referenceid, Referencetype
+                    # Use double prefix format: X-Amz-Meta-X-Amz-Meta-{key}
+                    minio_metadata = {
+                        "X-Amz-Meta-Filename": original_file_name,
+                        "X-Amz-Meta-Id": file_uuid,
+                        "X-Amz-Meta-Mimetype": mime_type,
+                        "X-Amz-Meta-Content-Type": mime_type,
+                    }
+                    
+                    # Extract specific metadata from file_event.metadata or job.metadata if available
+                    # These should already be in the correct format (Entityid, Entitytype, Referenceid, Referencetype)
+                    # Map of allowed metadata keys to preserve
+                    allowed_keys = ["Entityid", "Entitytype", "Referenceid", "Referencetype"]
+                    
+                    # Check file_event.metadata first, then job.metadata
+                    sources = []
+                    if file_event.metadata:
+                        sources.append(file_event.metadata)
+                    if job.metadata:
+                        sources.append(job.metadata)
+                    
+                    for key in allowed_keys:
+                        value = None
+                        # Check all sources for the key (with various prefix formats)
+                        for source in sources:
+                            value = (
+                                source.get(f"X-Amz-Meta-{key}") or
+                                source.get(f"X-Amz-Meta-X-Amz-Meta-{key}") or
+                                source.get(key)
+                            )
+                            if value is not None:
+                                break
+                        
+                        if value is not None:
+                            # Ensure double prefix format
+                            minio_metadata[f"X-Amz-Meta-{key}"] = str(value)
+
+                    uploaded = await local_minio.put_object_bytes(
+                        local_bucket,
+                        dest_object_key,
+                        file_bytes,
+                        content_type=mime_type,  # Use proper MIME type
+                        metadata=minio_metadata,
+                    )
+                    if not uploaded:
+                        raise RuntimeError(
+                            f"Failed to upload to local MinIO: s3://{local_bucket}/{dest_object_key}"
+                        )
+
+                    file_event.file_path = dest_object_key
+                    file_event.file_url = f"s3://{local_bucket}/{dest_object_key}"
+                    file_event.metadata = {
+                        **(file_event.metadata or {}),
+                        "nxtworkforce_saved": True,
+                        "nxtworkforce_bucket": local_bucket,
+                        "nxtworkforce_object_key": dest_object_key,
+                        "nxtworkforce_uuid": file_uuid,  # Store UUID without extension for database ID
+                    }
             
             # Publish batch to Kafka
             # Include connection_list in metadata so resume parser can extract MySQL config

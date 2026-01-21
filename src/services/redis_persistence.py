@@ -10,6 +10,7 @@ import structlog
 
 from src.clients.redis_client import redis_client
 from src.config.redis_settings import redis_settings
+from src.config.settings import settings
 from src.models.schemas import FileEvent, SourceConfig
 from src.utils.connection_key import generate_connection_key
 
@@ -46,7 +47,12 @@ class RedisPersistence:
         import hashlib
         key_string = f"{file_event.source_type.value}:{file_event.file_path}:{file_event.file_name}"
         file_hash = hashlib.md5(key_string.encode()).hexdigest()
-        return f"{self.FILE_TRACKING_PREFIX}{org_id}:{file_hash}"
+        # Support global vs org-scoped file tracking
+        # - org: poller:file:{org_id}:{hash}
+        # - global: poller:file:global:{hash}
+        scope = (settings.file_tracking_scope or "org").lower()
+        scope_key = "global" if scope == "global" else org_id
+        return f"{self.FILE_TRACKING_PREFIX}{scope_key}:{file_hash}"
     
     def _get_connection_key(self, org_id: str, source_config: SourceConfig) -> str:
         """Generate Redis key for connection statistics."""

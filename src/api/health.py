@@ -386,3 +386,79 @@ async def get_file_event_by_id(event_id: str):
     except Exception as e:
         logger.error("Failed to get file event", event_id=event_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to retrieve file event: {str(e)}")
+
+
+@router.get("/api/file-events/processed", response_model=List[str])
+async def get_processed_file_events(
+    org_id: Optional[str] = Query(None, description="Organization ID (required when scope=org). Ignored when scope=global."),
+    object_keys: str = Query(..., description="Comma-separated list of object keys to check"),
+    scope: str = Query("global", description="Tracking scope: org (only this org) or global (any org)")
+):
+    """
+    Check if a list of object keys have already been processed by the poller worker for a given organization.
+    Returns a list of object keys that have been processed.
+    
+    scope=org:
+      Only returns files processed for the specified org_id.
+      Files processed for different organizations are considered as not processed.
+
+    scope=global:
+      Returns files processed for ANY organization (cross-org de-dupe).
+      This matches: if Org 1 already processed File X, Org 2 should skip File X.
+    """
+    try:
+        if not database_client._initialized:
+            raise HTTPException(status_code=503, detail="Database not initialized")
+
+        scope_norm = (scope or "org").lower().strip()
+        if scope_norm not in {"org", "global"}:
+            raise HTTPException(status_code=400, detail="Invalid scope. Use scope=org or scope=global")
+
+        if scope_norm == "org" and not org_id:
+            raise HTTPException(status_code=400, detail="org_id is required when scope=org")
+        
+        keys_to_check = [key.strip() for key in object_keys.split(',') if key.strip()]
+        if not keys_to_check:
+            return []
+
+        async with database_client.get_session() as session:
+            from sqlalchemy import select
+            from src.models.file_events import FileEvent as FileEventModel
+            from src.models.poller_jobs import PollerJob
+            
+            # Query file_events table for processed files.
+            # If scope=org, filter by PollerJob.org_id.
+            stmt = (
+                select(FileEventModel.object_key)
+                .distinct()
+                .join(PollerJob, FileEventModel.poller_job_id == PollerJob.id)
+                .where(
+                    FileEventModel.object_key.in_(keys_to_check),
+                    FileEventModel.processed_at.isnot(None)  # Only files that have been processed
+                )
+            )
+            if scope_norm == "org":
+                stmt = stmt.where(PollerJob.org_id == org_id)
+            result = await session.execute(stmt)
+            processed_keys = result.scalars().all()
+            
+            logger.info(
+                "Checked processed file events",
+                org_id=org_id,
+                scope=scope_norm,
+                total_keys_checked=len(keys_to_check),
+                processed_keys_count=len(processed_keys),
+                processed_keys=list(processed_keys),
+                message=(
+                    f"scope={scope_norm}. "
+                    + (f"Only org_id={org_id} is considered." if scope_norm == "org" else "Any org is considered (global de-dupe).")
+                ),
+            )
+            
+            return processed_keys
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to check processed file events", org_id=org_id, error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to check processed file events: {str(e)}")
