@@ -68,6 +68,11 @@ class PollerWorkerConfig(BaseSettings):
     
     # File Processing Configuration
     max_file_size: int = Field(104857600, env="MAX_FILE_SIZE")  # 100MB
+
+    # File Tracking Scope
+    # - "org": processed tracking is isolated per org_id (default legacy behavior)
+    # - "global": if a file is processed once (any org), it will be considered processed for all orgs
+    file_tracking_scope: str = Field("global", env="FILE_TRACKING_SCOPE")
     
     @property
     def supported_file_extensions(self) -> List[str]:
@@ -93,6 +98,9 @@ class PollerWorkerConfig(BaseSettings):
     minio_access_key: str = Field("minioadmin", env="MINIO_ACCESS_KEY")
     minio_secret_key: str = Field("minioadmin", env="MINIO_SECRET_KEY")
     minio_secure: bool = Field(False, env="MINIO_SECURE")
+    # When job.metadata.nxtworkforce == true, poller-worker will first upload files into this MinIO bucket
+    # using the above MINIO_* credentials, then publish file events pointing to the uploaded object.
+    nxtworkforce_save_bucket: str = Field("resume-bucket", env="NXTWORKFORCE_SAVE_BUCKET")
     
     model_config = {
         "env_file": ".env",

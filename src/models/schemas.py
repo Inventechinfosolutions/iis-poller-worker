@@ -78,6 +78,7 @@ class PollingJob(BaseModel):
     mysqlConfiguration: Optional[MySQLConfiguration] = Field(None, description="MySQL configuration (same format as batch-details)")
     file_pattern: Optional[str] = Field(None, description="File pattern to match")
     priority: str = Field("normal", description="Job priority")
+    batch_size: Optional[int] = Field(None, description="Batch size for processing files (overrides default)")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Job creation timestamp")
     scheduled_at: Optional[datetime] = Field(None, description="Scheduled execution time")

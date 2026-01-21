@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from src.models.schemas import SourceType, FileEvent, SourceConfig
 from src.utils.connection_key import generate_connection_key
 from src.services.redis_persistence import redis_persistence
+from src.config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
@@ -98,9 +99,14 @@ class FileTracker:
         Returns:
             True if file has been processed, False otherwise
         """
+        # Resolve scope: org vs global
+        effective_org_id = org_id
+        if (settings.file_tracking_scope or "org").lower() == "global":
+            effective_org_id = "global"
+
         # Check Redis first (persistent storage)
         if redis_persistence._initialized:
-            redis_result = await redis_persistence.is_file_processed(org_id, file_event)
+            redis_result = await redis_persistence.is_file_processed(effective_org_id, file_event)
             if redis_result:
                 return True
         
@@ -113,9 +119,9 @@ class FileTracker:
         )
         
         # Check by file key
-        if file_key in self._processed_files[org_id][source_type]:
+        if file_key in self._processed_files[effective_org_id][source_type]:
             logger.debug("File already processed (by key)",
-                        org_id=org_id,
+                        org_id=effective_org_id,
                         file_name=file_event.file_name,
                         file_path=file_event.file_path,
                         source_type=source_type)
@@ -123,9 +129,9 @@ class FileTracker:
         
         # Check by checksum if available
         if file_event.checksum:
-            if file_event.checksum in self._processed_checksums[org_id]:
+            if file_event.checksum in self._processed_checksums[effective_org_id]:
                 logger.debug("File already processed (by checksum)",
-                            org_id=org_id,
+                            org_id=effective_org_id,
                             file_name=file_event.file_name,
                             checksum=file_event.checksum)
                 return True
@@ -142,9 +148,14 @@ class FileTracker:
             file_event: FileEvent object
             success: Whether the file was successfully processed (default: True)
         """
+        # Resolve scope: org vs global
+        effective_org_id = org_id
+        if (settings.file_tracking_scope or "org").lower() == "global":
+            effective_org_id = "global"
+
         # Save to Redis first (persistent storage)
         if redis_persistence._initialized:
-            await redis_persistence.mark_file_processed(org_id, file_event, success)
+            await redis_persistence.mark_file_processed(effective_org_id, file_event, success)
         
         # Also save to in-memory cache (fast lookup)
         source_type = file_event.source_type.value
@@ -157,14 +168,14 @@ class FileTracker:
         processed_time = datetime.utcnow()
         
         # Track by file key
-        self._processed_files[org_id][source_type][file_key] = processed_time
+        self._processed_files[effective_org_id][source_type][file_key] = processed_time
         
         # Track by checksum if available
         if file_event.checksum:
-            self._processed_checksums[org_id][file_event.checksum] = processed_time
+            self._processed_checksums[effective_org_id][file_event.checksum] = processed_time
         
         logger.debug("File marked as processed",
-                    org_id=org_id,
+                    org_id=effective_org_id,
                     file_name=file_event.file_name,
                     file_path=file_event.file_path,
                     source_type=source_type,

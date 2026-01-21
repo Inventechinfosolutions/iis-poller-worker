@@ -175,6 +175,97 @@ class MinIOClient:
                         error=str(e))
             return False
 
+    async def ensure_bucket(self, bucket_name: str) -> bool:
+        """Ensure bucket exists; create if missing."""
+        if not self.client:
+            logger.error("MinIO client not initialized")
+            return False
+        try:
+            exists = await self.bucket_exists(bucket_name)
+            if exists:
+                return True
+            await asyncio.to_thread(self.client.make_bucket, bucket_name)
+            logger.info("Created bucket in MinIO", bucket_name=bucket_name)
+            return True
+        except Exception as e:
+            logger.error("Failed to ensure bucket", bucket_name=bucket_name, error=str(e))
+            return False
+
+    async def put_object_bytes(
+        self,
+        bucket_name: str,
+        object_name: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Upload bytes to MinIO/S3 with optional metadata.
+        
+        Args:
+            bucket_name: Name of the bucket
+            object_name: Name of the object (object key)
+            data: File bytes to upload
+            content_type: MIME type of the file
+            metadata: Optional metadata dictionary to store with the object
+        """
+        if not self.client:
+            logger.error("MinIO client not initialized")
+            return False
+
+        try:
+            from io import BytesIO
+
+            if not await self.ensure_bucket(bucket_name):
+                return False
+
+            bio = BytesIO(data)
+            
+            # Convert metadata dict to MinIO metadata format
+            # MinIO's put_object metadata parameter expects keys WITHOUT X-Amz-Meta- prefix
+            # It automatically adds X-Amz-Meta- prefix to each key
+            # To get double prefix (X-Amz-Meta-X-Amz-Meta-), we pass keys with X-Amz-Meta- prefix
+            minio_metadata = {}
+            if metadata:
+                for key, value in metadata.items():
+                    if value is not None:
+                        # If key already has X-Amz-Meta- prefix, keep it (MinIO will add another, creating double prefix)
+                        # If key doesn't have prefix, add it so MinIO can add another
+                        if key.startswith("X-Amz-Meta-"):
+                            # Key already has prefix, MinIO will add another one
+                            meta_key = key
+                        else:
+                            # Add prefix so MinIO can add another one for double prefix
+                            meta_key = f"X-Amz-Meta-{key}"
+                        minio_metadata[meta_key] = str(value)
+            
+            await asyncio.to_thread(
+                self.client.put_object,
+                bucket_name,
+                object_name,
+                bio,
+                length=len(data),
+                content_type=content_type,
+                metadata=minio_metadata if minio_metadata else None,
+            )
+            logger.info(
+                "Object uploaded to MinIO",
+                bucket_name=bucket_name,
+                object_name=object_name,
+                size=len(data),
+                has_metadata=bool(metadata),
+                metadata_keys=list(metadata.keys()) if metadata else [],
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "Failed to upload object to MinIO",
+                bucket_name=bucket_name,
+                object_name=object_name,
+                error=str(e),
+            )
+            return False
+
 
 # Global MinIO client instance (will be initialized with config when needed)
 minio_client = None
