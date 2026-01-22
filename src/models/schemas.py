@@ -2,6 +2,7 @@
 Data models and schemas for poller worker service.
 """
 
+import os
 from typing import Optional, Dict, Any, List, Union
 from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
@@ -26,6 +27,7 @@ class SourceType(str, Enum):
     SFTP = "sftp"
     LOCAL = "local"
     HTTP = "http"
+    ONEDRIVE = "onedrive"  # Microsoft OneDrive integration
 
 
 class SourceConfig(BaseModel):
@@ -93,8 +95,8 @@ class PollingJob(BaseModel):
                 self.org_id = f"org_{self.job_id}"
             return self
         
-        # Try to build connection_list from configurationType and mysqlConfiguration (same format as batch-details)
-        if self.configurationType or self.mysqlConfiguration:
+        # Try to build connection_list from configurationType, mysqlConfiguration, or metadata.onedrive_config
+        if self.configurationType or self.mysqlConfiguration or (self.metadata and self.metadata.get("onedrive_config")):
             self.connection_list = []
             
             # Convert MinIO configuration to SourceConfig
@@ -121,6 +123,23 @@ class PollingJob(BaseModel):
                     database_table=self.mysqlConfiguration.tableName,
                 )
                 self.connection_list.append(mysql_config)
+            
+            # Convert OneDrive configuration from metadata to SourceConfig
+            if self.metadata and self.metadata.get("onedrive_config"):
+                config = self.metadata["onedrive_config"]
+                self.connection_list.append(SourceConfig(
+                    source_type=SourceType.ONEDRIVE,
+                    endpoint="https://graph.microsoft.com/v1.0",
+                    credentials={
+                        "userEmail": config.get("userEmail"),
+                        "tenantId": config.get("tenantId"),
+                        "driveId": config.get("driveId"),
+                        "selectedFolders": config.get("selectedFolders") or [],
+                        "resolvedFolders": config.get("resolvedFolders") or [],
+                        "oauth": config.get("oauth") or {},
+                        "orgId": self.org_id,
+                    },
+                ))
         
         # If connection_list is still not set, try to use source_config (backward compatibility)
         if not self.connection_list:
