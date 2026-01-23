@@ -80,6 +80,7 @@ class PollingJob(BaseModel):
     priority: str = Field("normal", description="Job priority")
     batch_size: Optional[int] = Field(None, description="Batch size for processing files (overrides default)")
     metadata: Optional[Dict[str, Any]] = Field(None, description="Additional metadata")
+    api_keys: Optional[List[str]] = Field(None, description="List of API keys to use for this job")
     created_at: datetime = Field(default_factory=datetime.utcnow, description="Job creation timestamp")
     scheduled_at: Optional[datetime] = Field(None, description="Scheduled execution time")
     
