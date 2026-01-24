@@ -143,6 +143,8 @@ class SourceConnector:
                     success = await self._connect_local(source_config)
                 elif source_type == SourceType.HTTP:
                     success = await self._connect_http(source_config)
+                elif source_type == SourceType.ONEDRIVE:
+                    success = await self._connect_onedrive(source_config)
                 else:
                     logger.error("Unsupported source type", source_type=source_type.value)
                     metrics_collector.record_connection_error(source_type.value, "unsupported_type")
@@ -223,6 +225,8 @@ class SourceConnector:
                 files = await self._list_files_local(source_config, file_pattern)
             elif source_type == SourceType.HTTP:
                 files = await self._list_files_http(source_config, file_pattern)
+            elif source_type == SourceType.ONEDRIVE:
+                files = await self._list_files_onedrive(source_config, file_pattern)
             else:
                 logger.error("Unsupported source type", source_type=source_type.value)
                 return []
@@ -240,13 +244,15 @@ class SourceConnector:
             return []
     
     async def read_file(self, source_config: SourceConfig, 
-                       file_path: str) -> Optional[bytes]:
+                       file_path: str,
+                       file_event_metadata: Optional[Dict[str, Any]] = None) -> Optional[bytes]:
         """
         Read file content from source.
         
         Args:
             source_config: Source configuration
             file_path: Path to the file
+            file_event_metadata: Optional metadata from file event (used for OneDrive to get drive/item IDs)
             
         Returns:
             File content as bytes, or None if error
@@ -273,6 +279,8 @@ class SourceConnector:
                 content = await self._read_file_local(source_config, file_path)
             elif source_type == SourceType.HTTP:
                 content = await self._read_file_http(source_config, file_path)
+            elif source_type == SourceType.ONEDRIVE:
+                content = await self._read_file_onedrive(source_config, file_path, file_event_metadata)
             else:
                 logger.error("Unsupported source type", source_type=source_type.value)
                 return None
@@ -1322,6 +1330,343 @@ class SourceConnector:
         except Exception as e:
             logger.error("Error calculating checksum", file_path=str(file_path), error=str(e))
             return ""
+
+    # ============================================================================
+    # ONEDRIVE SOURCE CONNECTION
+    # ============================================================================
+    # OneDrive integration: uses Microsoft Graph directly (token refresh + list + download).
+    
+    async def _connect_onedrive(self, source_config: SourceConfig) -> bool:
+        """
+        Connect to OneDrive source (Microsoft Graph).
+        No persistent connection required; we cache auth/session metadata per org/user.
+        """
+        try:
+            connection_key = self._generate_connection_key(SourceType.ONEDRIVE, source_config)
+            self._connections[connection_key] = {
+                "config": source_config,
+                "connected_at": datetime.utcnow(),
+                "source_type": SourceType.ONEDRIVE,
+                "access_token": None,
+                "access_token_expires_at": None,
+            }
+            
+            logger.info("OneDrive connector initialized", 
+                       connection_key=connection_key,
+                       graph_endpoint=(source_config.endpoint or "https://graph.microsoft.com/v1.0"))
+            return True
+            
+        except Exception as e:
+            logger.error("Error initializing OneDrive connector", 
+                        error=str(e))
+            return False
+
+    async def _get_onedrive_access_token(self, source_config: SourceConfig) -> str:
+        """Get Microsoft Graph access token using OAuth2 refresh token flow."""
+        import httpx
+        from datetime import timedelta
+        from src.utils.secrets_decrypter import decrypt_maybe
+
+        connection_key = self._generate_connection_key(SourceType.ONEDRIVE, source_config)
+        conn = self._connections.get(connection_key) or {}
+
+        # Return cached token if still valid
+        token = conn.get("access_token")
+        expires_at = conn.get("access_token_expires_at")
+        if token and expires_at and isinstance(expires_at, datetime):
+            if expires_at - datetime.utcnow() > timedelta(seconds=60):
+                return token
+
+        # Get OAuth credentials
+        creds = source_config.credentials or {}
+        oauth = creds.get("oauth") or {}
+        tenant_id = creds.get("tenantId")
+        client_id = oauth.get("clientId")
+        client_secret_raw = oauth.get("clientSecretEncrypted") or oauth.get("clientSecret")
+        refresh_token_raw = oauth.get("refreshTokenEncrypted") or oauth.get("refreshToken")
+        
+        if not all([tenant_id, client_id, client_secret_raw, refresh_token_raw]):
+            raise RuntimeError("OneDrive OAuth config missing required fields")
+        
+        # Decrypt tokens
+        try:
+            client_secret = decrypt_maybe(client_secret_raw).strip()
+            refresh_token = decrypt_maybe(refresh_token_raw).strip()
+            if not client_secret or not refresh_token:
+                raise ValueError("Decrypted tokens are empty")
+        except Exception as e:
+            logger.error("Failed to decrypt OneDrive OAuth tokens", error=str(e))
+            raise RuntimeError(f"Failed to decrypt OneDrive OAuth tokens: {str(e)}") from e
+
+        # Request new token
+        token_endpoint = oauth.get("tokenEndpoint") or f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+        scopes = oauth.get("scopes") or []
+        scope_str = " ".join(scopes) if isinstance(scopes, list) else str(scopes)
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(token_endpoint, data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": scope_str,
+            })
+            resp.raise_for_status()
+            payload = resp.json()
+
+        access_token = payload.get("access_token")
+        expires_in = int(payload.get("expires_in") or 3600)
+        if not access_token:
+            raise RuntimeError("Failed to obtain access_token from Microsoft")
+
+        # Cache token
+        conn["access_token"] = access_token
+        conn["access_token_expires_at"] = datetime.utcnow() + timedelta(seconds=expires_in)
+        self._connections[connection_key] = conn
+        return access_token
+    
+    async def _resolve_onedrive_folder_id(self, source_config: SourceConfig, 
+                                          drive_id: str, folder_name: str) -> Optional[str]:
+        """
+        Resolve folderId from folderName by querying Microsoft Graph.
+        
+        Args:
+            source_config: Source configuration
+            drive_id: OneDrive drive ID
+            folder_name: Name of the folder to find
+            
+        Returns:
+            Folder ID if found, None otherwise
+        """
+        try:
+            import httpx
+            
+            access_token = await self._get_onedrive_access_token(source_config)
+            graph_base = (source_config.endpoint or "https://graph.microsoft.com/v1.0").rstrip("/")
+            
+            # Search for folder by name in the root of the drive
+            # First, get root folder children
+            root_url = f"{graph_base}/drives/{drive_id}/root/children"
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    root_url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                response.raise_for_status()
+                data = response.json() or {}
+                
+                items = data.get("value", []) or []
+                
+                # Look for folder with matching name
+                for item in items:
+                    if item.get("folder") and item.get("name") == folder_name:
+                        folder_id = item.get("id")
+                        logger.info(
+                            "Resolved folderId from folderName",
+                            folder_name=folder_name,
+                            folder_id=folder_id,
+                            drive_id=drive_id
+                        )
+                        return folder_id
+                
+                logger.warning(
+                    "Folder not found by name",
+                    folder_name=folder_name,
+                    drive_id=drive_id,
+                    available_folders=[item.get("name") for item in items if item.get("folder")]
+                )
+                return None
+                
+        except Exception as e:
+            logger.error(
+                "Error resolving folderId from folderName",
+                folder_name=folder_name,
+                drive_id=drive_id,
+                error=str(e)
+            )
+            return None
+
+    async def _list_files_onedrive_non_recursive(self, source_config: SourceConfig,
+                                                 drive_id: str, folder_id: str,
+                                                 folder_path: str, file_pattern: Optional[str],
+                                                 access_token: str, graph_base: str) -> List[FileEvent]:
+        """List files directly from OneDrive folder (non-recursive - only direct files, no subfolders)."""
+        import httpx
+        from src.models.schemas import FileEvent
+        from uuid import uuid4
+        from pathlib import Path
+        import fnmatch
+        
+        files: List[FileEvent] = []
+        list_url = f"{graph_base}/drives/{drive_id}/items/{folder_id}/children"
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(list_url, headers={"Authorization": f"Bearer {access_token}"})
+                response.raise_for_status()
+                items = (response.json() or {}).get("value", []) or []
+            
+            for item in items:
+                # Skip folders - only process files
+                if not item.get("file"):
+                    continue
+                
+                file_name = item.get("name")
+                file_ext = Path(file_name).suffix.lower() if file_name else ""
+                
+                # Only process .pdf and .docx files
+                if file_ext not in ['.pdf', '.docx']:
+                    continue
+                
+                # Apply file pattern filter
+                if file_pattern and file_pattern != '*' and file_name:
+                    if not fnmatch.fnmatch(file_name, file_pattern):
+                        continue
+                
+                files.append(FileEvent(
+                    event_id=str(uuid4()),
+                    job_id="",
+                    source_type=SourceType.ONEDRIVE,
+                    file_path=f"onedrive://{drive_id}/{item.get('id')}",
+                    file_name=file_name,
+                    file_size=item.get("size", 0) or 0,
+                    file_type=file_ext,
+                    metadata={
+                        "drive_id": drive_id,
+                        "file_id": item.get("id"),
+                        "folder_path": folder_path,
+                    },
+                ))
+            
+            pdf_count = sum(1 for f in files if f.file_type == '.pdf')
+            docx_count = sum(1 for f in files if f.file_type == '.docx')
+            logger.info(
+                "Scanned OneDrive folder",
+                folder_path=folder_path,
+                total_files=len(files),
+                pdf_files=pdf_count,
+                docx_files=docx_count,
+            )
+        except Exception as e:
+            logger.error("Error listing OneDrive files", folder_path=folder_path, error=str(e))
+        
+        return files
+
+    async def _list_files_onedrive(self, source_config: SourceConfig, 
+                                  file_pattern: Optional[str] = None) -> List[FileEvent]:
+        """List files from OneDrive via Microsoft Graph. Supports multiple folders (non-recursive)."""
+        try:
+            creds = source_config.credentials or {}
+            user_email = creds.get("userEmail")
+            drive_id = creds.get("driveId")
+            resolved_folders = creds.get("resolvedFolders") or []
+
+            if not user_email or not drive_id:
+                logger.error("OneDrive config missing userEmail/driveId", user_email=user_email, drive_id=drive_id)
+                return []
+
+            # Filter valid folders (must have folderId and folderPath)
+            valid_folders = [
+                f for f in resolved_folders 
+                if f.get("folderId") and f.get("folderPath", "").strip()
+            ]
+            
+            if not valid_folders:
+                logger.warning(
+                    "Skipping OneDrive job - no valid folders found",
+                    user_email=user_email,
+                    drive_id=drive_id,
+                    resolved_folders_count=len(resolved_folders),
+                )
+                return []
+
+            access_token = await self._get_onedrive_access_token(source_config)
+            graph_base = (source_config.endpoint or "https://graph.microsoft.com/v1.0").rstrip("/")
+            all_file_events: List[FileEvent] = []
+            
+            # Process each folder (non-recursive - only direct files)
+            for folder in valid_folders:
+                folder_id = folder.get("folderId")
+                folder_path = folder.get("folderPath", "").strip()
+                
+                logger.info("Scanning OneDrive folder", folder_path=folder_path, folder_id=folder_id)
+                
+                folder_files = await self._list_files_onedrive_non_recursive(
+                    source_config=source_config,
+                    drive_id=drive_id,
+                    folder_id=folder_id,
+                    folder_path=folder_path,
+                    file_pattern=file_pattern,
+                    access_token=access_token,
+                    graph_base=graph_base,
+                )
+                all_file_events.extend(folder_files)
+            
+            pdf_count = sum(1 for f in all_file_events if f.file_type.lower() == '.pdf')
+            docx_count = sum(1 for f in all_file_events if f.file_type.lower() == '.docx')
+            
+            logger.info(
+                "Listed OneDrive files from all folders",
+                total_files=len(all_file_events),
+                pdf_files=pdf_count,
+                docx_files=docx_count,
+                user_email=user_email,
+                folders_scanned=len(valid_folders),
+            )
+            return all_file_events
+                
+        except Exception as e:
+            logger.error("Error listing OneDrive files", error=str(e))
+            return []
+
+    async def _read_file_onedrive(self, source_config: SourceConfig,
+                                  file_path: str, file_event_metadata: Optional[Dict[str, Any]] = None) -> Optional[bytes]:
+        """Read file bytes from OneDrive via Microsoft Graph."""
+        try:
+            import httpx
+
+            # Extract drive_id and item_id from metadata or file_path
+            metadata = file_event_metadata or {}
+            drive_id = metadata.get("drive_id")
+            item_id = metadata.get("file_id")
+
+            if not drive_id or not item_id:
+                # Parse from file_path: "onedrive://{driveId}/{itemId}"
+                if file_path.startswith("onedrive://"):
+                    parts = file_path.replace("onedrive://", "").split("/", 1)
+                    if len(parts) == 2:
+                        drive_id, item_id = parts[0], parts[1]
+
+            if not drive_id or not item_id:
+                logger.error("OneDrive driveId/itemId missing", file_path=file_path)
+                return None
+
+            access_token = await self._get_onedrive_access_token(source_config)
+            graph_base = (source_config.endpoint or "https://graph.microsoft.com/v1.0").rstrip("/")
+
+            # Get download URL
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                meta_resp = await client.get(
+                    f"{graph_base}/drives/{drive_id}/items/{item_id}",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                meta_resp.raise_for_status()
+                download_url = (meta_resp.json() or {}).get("@microsoft.graph.downloadUrl")
+
+            if not download_url:
+                logger.error("OneDrive item missing downloadUrl", drive_id=drive_id, item_id=item_id)
+                return None
+
+            # Download file
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                dl_resp = await client.get(download_url)
+                dl_resp.raise_for_status()
+                return dl_resp.content
+            
+        except Exception as e:
+            logger.error("Error reading OneDrive file", file_path=file_path, error=str(e))
+            return None
 
 
 # Global source connector instance

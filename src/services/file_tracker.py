@@ -16,6 +16,9 @@ from src.models.schemas import SourceType, FileEvent, SourceConfig
 from src.utils.connection_key import generate_connection_key
 from src.services.redis_persistence import redis_persistence
 from src.config.settings import settings
+from src.clients.database_client import database_client
+from src.models.file_events import FileEvent as FileEventModel
+from sqlalchemy import select, and_, or_
 
 logger = structlog.get_logger(__name__)
 
@@ -90,7 +93,7 @@ class FileTracker:
     async def is_file_processed(self, org_id: str, file_event: FileEvent) -> bool:
         """
         Check if a file has already been processed.
-        Checks Redis first, then in-memory cache.
+        Checks Redis first, then in-memory cache, then database (fallback).
         
         Args:
             org_id: Organization identifier
@@ -104,13 +107,13 @@ class FileTracker:
         if (settings.file_tracking_scope or "org").lower() == "global":
             effective_org_id = "global"
 
-        # Check Redis first (persistent storage)
+        # 1. Check Redis first (fast, persistent storage)
         if redis_persistence._initialized:
             redis_result = await redis_persistence.is_file_processed(effective_org_id, file_event)
             if redis_result:
                 return True
         
-        # Fallback to in-memory cache
+        # 2. Check in-memory cache (fast)
         source_type = file_event.source_type.value
         file_key = self._generate_file_key(
             file_event.file_path,
@@ -118,7 +121,6 @@ class FileTracker:
             file_event.source_type
         )
         
-        # Check by file key
         if file_key in self._processed_files[effective_org_id][source_type]:
             logger.debug("File already processed (by key)",
                         org_id=effective_org_id,
@@ -127,7 +129,7 @@ class FileTracker:
                         source_type=source_type)
             return True
         
-        # Check by checksum if available
+        # 3. Check by checksum in memory cache
         if file_event.checksum:
             if file_event.checksum in self._processed_checksums[effective_org_id]:
                 logger.debug("File already processed (by checksum)",
@@ -136,7 +138,85 @@ class FileTracker:
                             checksum=file_event.checksum)
                 return True
         
+        # 4. Fallback: Check database (slower but persistent - protects against Redis flush)
+        if database_client._initialized:
+            db_result = await self._check_database_for_file(effective_org_id, file_event)
+            if db_result:
+                logger.info("File found in database (Redis was likely flushed), skipping reprocessing",
+                           org_id=effective_org_id,
+                           file_name=file_event.file_name,
+                           file_path=file_event.file_path,
+                           source_type=source_type)
+                # Re-populate Redis cache for faster future lookups
+                await redis_persistence.mark_file_processed(effective_org_id, file_event, success=True)
+                return True
+        
         return False
+    
+    async def _check_database_for_file(self, org_id: str, file_event: FileEvent) -> bool:
+        """
+        Check database to see if file was already processed.
+        This is a fallback when Redis is flushed.
+        
+        For OneDrive: checks by original_file_path from metadata
+        For all sources: checks by checksum from metadata
+        """
+        try:
+            async with database_client.get_session() as session:
+                # For OneDrive: check by original_file_path in metadata
+                if file_event.source_type == SourceType.ONEDRIVE:
+                    original_path = (file_event.metadata or {}).get("original_file_path") or file_event.file_path
+                    if original_path and original_path.startswith("onedrive://"):
+                        # Query all OneDrive files with matching file_name, then check metadata in Python
+                        # (More reliable across different database JSON implementations)
+                        stmt = select(FileEventModel).where(
+                            and_(
+                                FileEventModel.source_type == SourceType.ONEDRIVE.value,
+                                FileEventModel.file_name == file_event.file_name
+                            )
+                        )
+                        result = await session.execute(stmt)
+                        for db_file in result.scalars():
+                            metadata = db_file.event_metadata or {}
+                            db_original_path = metadata.get("original_file_path")
+                            if db_original_path == original_path:
+                                return True
+                
+                # For all sources: check by checksum in metadata (if available)
+                if file_event.checksum:
+                    stmt = select(FileEventModel).where(
+                        and_(
+                            FileEventModel.source_type == file_event.source_type.value,
+                            FileEventModel.file_name == file_event.file_name
+                        )
+                    )
+                    result = await session.execute(stmt)
+                    for db_file in result.scalars():
+                        metadata = db_file.event_metadata or {}
+                        db_checksum = metadata.get("checksum")
+                        if db_checksum == file_event.checksum:
+                            return True
+                
+                # Fallback: check by file_path/object_key and file_name
+                stmt = select(FileEventModel).where(
+                    and_(
+                        FileEventModel.source_type == file_event.source_type.value,
+                        FileEventModel.file_name == file_event.file_name,
+                        or_(
+                            FileEventModel.object_key == file_event.file_path,
+                            FileEventModel.object_key.like(f"%{file_event.file_name}%")
+                        )
+                    )
+                ).limit(1)
+                result = await session.execute(stmt)
+                return result.scalar_one_or_none() is not None
+                
+        except Exception as e:
+            logger.error("Error checking database for file",
+                        org_id=org_id,
+                        file_name=file_event.file_name,
+                        error=str(e))
+            return False
     
     async def mark_file_as_processed(self, org_id: str, file_event: FileEvent, success: bool = True):
         """

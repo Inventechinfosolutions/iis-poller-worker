@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Dict, Any, List
 import structlog
 
-from src.models.schemas import PollingJob, FileEvent, SourceConfig
+from src.models.schemas import PollingJob, FileEvent, SourceConfig, SourceType
 from src.models.poller_jobs import JobStatus
 from src.services.kafka_consumer import polling_queue_consumer
 from src.services.kafka_producer import file_event_queue_producer
@@ -407,20 +407,65 @@ class PollerWorker:
         """List files from source with timeout."""
         logger.info("Listing files", file_pattern=file_pattern, **context)
         try:
+            # Use longer timeout for OneDrive due to recursive folder scanning
+            # OneDrive can have deeply nested folders that take time to scan
+            source_type = source_config.source_type.value if hasattr(source_config.source_type, 'value') else str(source_config.source_type)
+            timeout_seconds = 300 if source_type == 'onedrive' else settings.read_timeout  # 5 minutes for OneDrive, default for others
+            
+            # Create context copy without source_type to avoid duplicate keyword argument
+            log_context = {k: v for k, v in context.items() if k != 'source_type'}
+            logger.debug("Using timeout for file listing", source_type=source_type, timeout_seconds=timeout_seconds, **log_context)
+            
             files = await with_timeout(
                 source_connector.list_files,
-                settings.read_timeout,
+                timeout_seconds,
                 source_config,
                 file_pattern,
                 operation_name="list_files"
             )
+            
+            # Filter files to only .pdf and .docx extensions
+            allowed_extensions = ['.pdf', '.docx']
+            total_files = len(files) if files else 0
+            filtered_files = []
+            
             if files:
-                logger.info("Files discovered", file_count=len(files), **context)
+                for file_event in files:
+                    file_ext = file_event.file_type.lower() if file_event.file_type else ""
+                    if file_ext in allowed_extensions:
+                        filtered_files.append(file_event)
+                    else:
+                        logger.debug(
+                            "Skipping file - not .pdf or .docx",
+                            file_name=file_event.file_name,
+                            file_type=file_ext,
+                            **context
+                        )
+            
+            if filtered_files:
+                logger.info(
+                    "Files discovered and filtered",
+                    total_files_found=total_files,
+                    files_after_filter=len(filtered_files),
+                    allowed_extensions=allowed_extensions,
+                    **context
+                )
             else:
-                logger.warning("No files found", **context)
-            return files or []
+                if total_files > 0:
+                    logger.warning(
+                        "No files match filter (.pdf or .docx)",
+                        total_files_found=total_files,
+                        allowed_extensions=allowed_extensions,
+                        **context
+                    )
+                else:
+                    logger.warning("No files found", **context)
+            
+            return filtered_files
         except asyncio.TimeoutError:
-            logger.error("List files timeout", timeout=settings.read_timeout, **context)
+            source_type = source_config.source_type.value if hasattr(source_config.source_type, 'value') else str(source_config.source_type)
+            timeout_used = 300 if source_type == 'onedrive' else settings.read_timeout
+            logger.error("List files timeout", timeout=timeout_used, source_type=source_type, **context)
             return []
     
     async def _process_files(self, job: PollingJob, files: list, source_config: SourceConfig,
@@ -494,22 +539,48 @@ class PollerWorker:
                 file_event.job_id = job.job_id
                 file_event.processed_at = datetime.utcnow()
 
-            # If nxtworkforce flag is set, first upload the file bytes to local MinIO (env.local MINIO_* creds)
-            # and publish file events pointing to the uploaded object.
+            # If nxtworkforce flag is set, first upload the file bytes to MinIO
+            # Use target_minio_config from job metadata if available (for OneDrive), otherwise use env vars
             nxtworkforce_enabled = bool((job.metadata or {}).get("nxtworkforce"))
             if nxtworkforce_enabled:
-                local_bucket = settings.nxtworkforce_save_bucket
-                local_minio = MinIOClient(
-                    {
-                        "endpoint": settings.minio_endpoint,
-                        "access_key": settings.minio_access_key,
-                        "secret_key": settings.minio_secret_key,
-                        "minio_secure": settings.minio_secure,
-                    }
-                )
+                target_minio_config = (job.metadata or {}).get("target_minio_config")
+                
+                if target_minio_config:
+                    # Use MinIO config from job metadata (for OneDrive jobs)
+                    local_bucket = target_minio_config.get("bucket_name")
+                    local_minio = MinIOClient(
+                        {
+                            "endpoint": target_minio_config.get("endpoint"),
+                            "access_key": target_minio_config.get("access_key"),
+                            "secret_key": target_minio_config.get("secret_key"),
+                            "minio_secure": target_minio_config.get("endpoint", "").startswith("https"),
+                        }
+                    )
+                else:
+                    # Fallback to env vars (for other sources)
+                    local_bucket = settings.nxtworkforce_save_bucket
+                    local_minio = MinIOClient(
+                        {
+                            "endpoint": settings.minio_endpoint,
+                            "access_key": settings.minio_access_key,
+                            "secret_key": settings.minio_secret_key,
+                            "minio_secure": settings.minio_secure,
+                        }
+                    )
 
                 for file_event in batch_files:
-                    file_bytes = await source_connector.read_file(source_config, file_event.file_path)
+                    # Store original OneDrive path in metadata before it gets changed to MinIO UUID
+                    # This is needed for file tracking - we track by original source path, not MinIO UUID
+                    if source_config.source_type == SourceType.ONEDRIVE:
+                        if not file_event.metadata:
+                            file_event.metadata = {}
+                        file_event.metadata["original_file_path"] = file_event.file_path
+                    
+                    file_bytes = await source_connector.read_file(
+                        source_config, 
+                        file_event.file_path,
+                        file_event_metadata=file_event.metadata if source_config.source_type == SourceType.ONEDRIVE else None
+                    )
                     if not file_bytes:
                         raise RuntimeError(f"Empty file bytes for {file_event.file_path}")
 
@@ -594,12 +665,35 @@ class PollerWorker:
 
                     file_event.file_path = dest_object_key
                     file_event.file_url = f"s3://{local_bucket}/{dest_object_key}"
+                    
+                    # Build metadata with source_config for resume-parser
+                    # Resume-parser expects metadata.source_config with MinIO details
+                    source_config_for_parser = None
+                    if target_minio_config:
+                        source_config_for_parser = {
+                            "source_type": target_minio_config.get("source_type", "minio"),
+                            "endpoint": target_minio_config.get("endpoint"),
+                            "access_key": target_minio_config.get("access_key"),
+                            "secret_key": target_minio_config.get("secret_key"),
+                        }
+                    else:
+                        # Fallback: use env MinIO config
+                        source_config_for_parser = {
+                            "source_type": "minio",
+                            "endpoint": settings.minio_endpoint,
+                            "access_key": settings.minio_access_key,
+                            "secret_key": settings.minio_secret_key,
+                        }
+                    
                     file_event.metadata = {
                         **(file_event.metadata or {}),
                         "nxtworkforce_saved": True,
                         "nxtworkforce_bucket": local_bucket,
                         "nxtworkforce_object_key": dest_object_key,
                         "nxtworkforce_uuid": file_uuid,  # Store UUID without extension for database ID
+                        "bucket": local_bucket,
+                        "bucket_name": local_bucket,
+                        "source_config": source_config_for_parser,  # For resume-parser
                     }
             
             # Publish batch to Kafka
@@ -623,8 +717,31 @@ class PollerWorker:
             )
             
             # Mark all files in batch as processed
+            # For OneDrive: use original_file_path from metadata for tracking (before it was changed to MinIO UUID)
             for file_event in batch_files:
-                await file_tracker.mark_file_as_processed(job.org_id, file_event, success=True)
+                if source_config.source_type == SourceType.ONEDRIVE:
+                    original_path = (file_event.metadata or {}).get("original_file_path")
+                    if original_path and original_path.startswith("onedrive://"):
+                        # Create tracking event with original OneDrive path
+                        tracking_event = FileEvent(
+                            event_id=file_event.event_id,
+                            job_id=file_event.job_id,
+                            source_type=file_event.source_type,
+                            file_path=original_path,
+                            file_name=file_event.file_name,
+                            file_size=file_event.file_size,
+                            file_type=file_event.file_type,
+                            file_url=file_event.file_url,
+                            checksum=file_event.checksum,
+                            metadata={k: v for k, v in (file_event.metadata or {}).items() if k != "original_file_path"}
+                        )
+                        await file_tracker.mark_file_as_processed(job.org_id, tracking_event, success=True)
+                    else:
+                        logger.warning("OneDrive file missing original_file_path, using current path",
+                                     file_name=file_event.file_name)
+                        await file_tracker.mark_file_as_processed(job.org_id, file_event, success=True)
+                else:
+                    await file_tracker.mark_file_as_processed(job.org_id, file_event, success=True)
                 
                 # Save file event to database
                 await file_event_service.create_file_event(file_event, poller_job_id=job.job_id)
@@ -656,17 +773,31 @@ class PollerWorker:
         return stats
     
     async def _should_skip_file(self, job: PollingJob, file_event: FileEvent) -> bool:
-        """Check if file should be skipped (already processed)."""
+        """Check if file should be skipped (already processed or wrong extension)."""
+        # Check if file is already processed
         is_processed = await file_tracker.is_file_processed(job.org_id, file_event)
         if is_processed:
-            logger.debug("File already processed, skipping", 
+            logger.info("File already processed, skipping", 
                         file_name=file_event.file_name,
                         file_type=file_event.file_type,
-                        org_id=job.org_id)
+                        org_id=job.org_id,
+                        job_id=job.job_id)
             return True
         
-        # Process all files regardless of extension
-        # File extension filtering is disabled to allow all file types from MinIO
+        # Only process .pdf and .docx files
+        allowed_extensions = ['.pdf', '.docx']
+        file_ext = (file_event.file_type or "").lower()
+        
+        if file_ext not in allowed_extensions:
+            logger.debug(
+                "Skipping file - not .pdf or .docx",
+                file_name=file_event.file_name,
+                file_type=file_ext,
+                allowed_extensions=allowed_extensions,
+                org_id=job.org_id
+            )
+            return True
+        
         return False
     
     async def _publish_file(self, job: PollingJob, file_event: FileEvent, context: Dict[str, Any]):

@@ -5,6 +5,8 @@ pydantic-settings==2.1.0
 
 # Kafka
 confluent-kafka>=2.3.0
+minio>=7.2.0
+
 
 # Logging and monitoring
 structlog==23.2.0
@@ -16,6 +18,9 @@ uvicorn[standard]==0.24.0
 
 # Utilities
 aiofiles==23.2.1
+tenacity>=8.2.0
+httpx>=0.25.0
+cryptography>=41.0.0
 
 # Redis for data persistence
 redis>=4.5.0
@@ -23,12 +28,6 @@ redis>=4.5.0
 # SQLAlchemy for database operations
 sqlalchemy[asyncio]>=2.0.44
 aiomysql>=0.2.0
-
-# MinIO client for object storage
-minio>=7.2.0
-
-# Retry library for resilient operations
-tenacity>=8.2.0
 
 # Optional: For memory monitoring (install if needed)
 # psutil>=5.9.0
