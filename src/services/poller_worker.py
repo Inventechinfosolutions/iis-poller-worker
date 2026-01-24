@@ -704,6 +704,9 @@ class PollerWorker:
                 "org_id": job.org_id,
                 "connection_list": self._convert_connection_list_to_dict(job.connection_list) if job.connection_list else []
             }
+            # Include API keys in metadata if provided
+            if job.api_keys:
+                batch_metadata["api_keys"] = job.api_keys
             await retry_handler.execute_with_retry(
                 file_event_queue_producer.publish_file_events_batch,
                 batch_files,
@@ -809,6 +812,9 @@ class PollerWorker:
             "org_id": job.org_id,
             "connection_list": self._convert_connection_list_to_dict(job.connection_list) if job.connection_list else []
         }
+        # Include API keys in metadata if provided
+        if job.api_keys:
+            file_metadata["api_keys"] = job.api_keys
         await retry_handler.execute_with_retry(
             file_event_queue_producer.publish_file_event,
             file_event,

@@ -4,6 +4,7 @@ Handles file listing and reading from S3-compatible storage.
 """
 
 import asyncio
+import unicodedata
 from typing import Optional, List, Dict, Any
 from minio import Minio
 from minio.error import S3Error
@@ -191,6 +192,47 @@ class MinIOClient:
             logger.error("Failed to ensure bucket", bucket_name=bucket_name, error=str(e))
             return False
 
+    def _sanitize_for_latin1(self, value: str) -> str:
+        """
+        Sanitize string to be encodable as latin-1.
+        MinIO metadata values must be encodable as latin-1.
+        Replaces problematic Unicode characters with ASCII equivalents.
+        """
+        if not value:
+            return value
+        
+        try:
+            # Try to encode as latin-1 first
+            value.encode('latin-1')
+            return value
+        except UnicodeEncodeError:
+            # Replace common Unicode characters with ASCII equivalents
+            replacements = {
+                '\u2013': '-',   # en-dash
+                '\u2014': '--',  # em-dash
+                '\u2018': "'",   # left single quotation mark
+                '\u2019': "'",   # right single quotation mark
+                '\u201C': '"',   # left double quotation mark
+                '\u201D': '"',   # right double quotation mark
+                '\u2026': '...', # horizontal ellipsis
+                '\u00A0': ' ',   # non-breaking space
+            }
+            
+            sanitized = value
+            for unicode_char, ascii_replacement in replacements.items():
+                sanitized = sanitized.replace(unicode_char, ascii_replacement)
+            
+            # For any remaining problematic characters, normalize and keep only ASCII
+            try:
+                normalized = unicodedata.normalize('NFKD', sanitized)
+                ascii_only = normalized.encode('ascii', 'ignore').decode('ascii')
+                # Verify it can be encoded as latin-1
+                ascii_only.encode('latin-1')
+                return ascii_only if ascii_only else value[:100]
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                # Final fallback: remove all non-latin-1 characters
+                return value.encode('latin-1', 'ignore').decode('latin-1') or value[:100]
+
     async def put_object_bytes(
         self,
         bucket_name: str,
@@ -237,7 +279,10 @@ class MinIOClient:
                         else:
                             # Add prefix so MinIO can add another one for double prefix
                             meta_key = f"X-Amz-Meta-{key}"
-                        minio_metadata[meta_key] = str(value)
+                        # Sanitize value to handle Unicode characters that can't be encoded as latin-1
+                        # MinIO metadata must be encodable as latin-1
+                        sanitized_value = self._sanitize_for_latin1(str(value))
+                        minio_metadata[meta_key] = sanitized_value
             
             await asyncio.to_thread(
                 self.client.put_object,
