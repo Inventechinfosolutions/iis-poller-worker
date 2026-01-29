@@ -72,7 +72,7 @@ class KafkaSettings(BaseSettings):
                 }
             },
             self.file_event_queue_topic: {
-                "num_partitions": 3,
+                "num_partitions": 20,  # Increased to support 10+ consumer instances for parallel processing
                 "replication_factor": self.replication_factor,
                 "config": {
                     "retention.ms": 604800000,  # 7 days
