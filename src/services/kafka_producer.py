@@ -129,9 +129,14 @@ class FileEventQueueProducer:
             # Serialize message
             message_json = json.dumps(message, default=str)
             
-            # Determine partition key for consistent partitioning
-            # Use org_id for better distribution across partitions
-            partition_key = f"{file_event.job_id}:{file_event.source_type.value}"
+            # Use None key for round-robin partition distribution
+            # This ensures even distribution across all 20 partitions
+            # Kafka will automatically distribute messages in round-robin fashion when key is None
+            partition_key = None
+            
+            logger.debug("Using round-robin partition distribution for file event",
+                        event_id=file_event.event_id,
+                        job_id=file_event.job_id)
             
             topic_name = kafka_settings.file_event_queue_topic
             logger.info("Publishing file event to Kafka", 
@@ -300,9 +305,15 @@ class FileEventQueueProducer:
             # Serialize batch message
             message_json = json.dumps(batch_message, default=str)
             
-            # Determine partition key for consistent partitioning
-            # Use job_id for better distribution across partitions
-            partition_key = f"{file_events[0].job_id}:batch"
+            # Use None key for round-robin partition distribution
+            # This ensures even distribution across all 20 partitions
+            # Kafka will automatically distribute messages in round-robin fashion when key is None
+            partition_key = None
+            
+            logger.debug("Using round-robin partition distribution for batch",
+                        batch_id=batch_message.get("batch_id"),
+                        batch_size=len(file_events),
+                        job_id=file_events[0].job_id if file_events else None)
             
             topic_name = kafka_settings.file_event_queue_topic
             logger.info("Publishing file events batch to Kafka", 
@@ -355,7 +366,7 @@ class FileEventQueueProducer:
                 metrics_collector.record_file_published("error")
             raise
     
-    async def _publish_message(self, topic: str, key: str, value: str, 
+    async def _publish_message(self, topic: str, key: Optional[str], value: str, 
                              headers: Optional[Dict[str, str]] = None):
         """Publish a message to Kafka topic."""
         try:
