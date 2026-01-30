@@ -31,6 +31,7 @@ from src.utils.backpressure import backpressure_manager
 from src.utils.tracing import tracer
 from src.config.settings import settings
 from src.clients.minio_client import MinIOClient
+from src.utils.watermark import apply_watermark
 
 logger = structlog.get_logger(__name__)
 
@@ -598,6 +599,33 @@ class PollerWorker:
                     file_uuid = str(uuid.uuid4())
                     # Use UUID only as object key (no extension)
                     dest_object_key = file_uuid
+                    
+                    # Apply watermark to file bytes before uploading
+                    # Pattern: nxtworkforceai - {file_uuid}
+                    original_size = len(file_bytes)
+                    try:
+                        watermarked_bytes = await apply_watermark(file_bytes, original_file_name, file_uuid)
+                        if watermarked_bytes and len(watermarked_bytes) > 0:
+                            file_bytes = watermarked_bytes
+                            logger.info(
+                                "Applied watermark to file",
+                                file_name=original_file_name,
+                                object_key=dest_object_key,
+                                original_size=original_size,
+                                watermarked_size=len(watermarked_bytes),
+                            )
+                        else:
+                            logger.warning(
+                                "Watermarking returned empty bytes, using original file",
+                                file_name=original_file_name,
+                            )
+                    except Exception as watermark_error:
+                        logger.error(
+                            "Failed to apply watermark, using original file",
+                            file_name=original_file_name,
+                            error=str(watermark_error),
+                        )
+                        # Continue with original file_bytes if watermarking fails
 
                     # Determine MIME type from file extension
                     mime_type, _ = mimetypes.guess_type(original_file_name)
@@ -622,6 +650,38 @@ class PollerWorker:
                         "X-Amz-Meta-Mimetype": mime_type,
                         "X-Amz-Meta-Content-Type": mime_type,
                     }
+                    
+                    # Add configuration stamping metadata when uploading from source MinIO to our MinIO
+                    # Pattern: nxtworkforceai - {file_uuid}
+                    if job.metadata:
+                        configuration_id = job.metadata.get("configuration_id")
+                        if configuration_id:
+                            # Stamping pattern: nxtworkforceai - {file_uuid}
+                            stamp_text = f"nxtworkforceai - {file_uuid}"
+                            minio_metadata["X-Amz-Meta-Stamp"] = stamp_text
+                            minio_metadata["X-Amz-Meta-Configuration-Id"] = str(configuration_id)
+                            
+                            # Add configuration type if available
+                            configuration_type = job.metadata.get("configuration_type")
+                            if configuration_type:
+                                minio_metadata["X-Amz-Meta-Configuration-Type"] = str(configuration_type)
+                            
+                            # Add organization ID (from job top-level or metadata)
+                            org_id = job.org_id or job.metadata.get("org_id") or job.metadata.get("organization_id")
+                            if org_id:
+                                minio_metadata["X-Amz-Meta-Organization-Id"] = str(org_id)
+                            
+                            # Add stamped timestamp
+                            stamped_at = datetime.utcnow().isoformat()
+                            minio_metadata["X-Amz-Meta-Stamped-At"] = stamped_at
+                            
+                            logger.info(
+                                "Stamping file with configuration metadata",
+                                file_name=original_file_name,
+                                object_key=dest_object_key,
+                                configuration_id=configuration_id,
+                                stamp_text=stamp_text,
+                            )
                     
                     # Extract specific metadata from file_event.metadata or job.metadata if available
                     # These should already be in the correct format (Entityid, Entitytype, Referenceid, Referencetype)
